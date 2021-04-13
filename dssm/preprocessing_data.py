@@ -42,7 +42,7 @@ class PrepareData:
                 if idx not in result_prepare['id_correct_answer']:
                     result_prepare['id_wrong_answer'].append(idx)
 
-            if not result_prepare['id_correct_answer']:
+            if not result_prepare['id_correct_answer'] or not result_prepare['id_wrong_answer']:
                 continue
 
             prep_data.append(result_prepare)

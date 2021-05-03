@@ -2,7 +2,7 @@ import torch
 
 import pytorch_lightning as pl
 from transformers import AdamW
-from sklearn.metrics import accuracy_score
+from torchmetrics import Accuracy, F1
 
 
 class ModelTrainer(pl.LightningModule):
@@ -14,6 +14,9 @@ class ModelTrainer(pl.LightningModule):
 
         self.model = model
         self.criterion = criterion
+
+        self.acc_start = Accuracy()
+        self.acc_end = Accuracy()
 
         # other
         self.lr = lr
@@ -42,11 +45,11 @@ class ModelTrainer(pl.LightningModule):
 
         start_pred = torch.argmax(logits_start, dim=1).squeeze(-1).cpu().detach().numpy()
         start_gold = start.cpu().detach().numpy()
-        accuracy_start = accuracy_score(start_pred, start_gold)
+        accuracy_start = self.acc_start(start_pred, start_gold)
 
         end_pred = torch.argmax(logits_end, dim=1).squeeze(-1).cpu().detach().numpy()
         end_gold = end.cpu().detach().numpy()
-        accuracy_end = accuracy_score(end_pred, end_gold)
+        accuracy_end = self.acc_end(end_pred, end_gold)
 
         return loss, loss_start, loss_end, loss_end, accuracy_start, accuracy_end
 
@@ -63,6 +66,12 @@ class ModelTrainer(pl.LightningModule):
 
         return loss
 
+    def training_epoch_end(self, outputs):
+        values = {'Epoch Accuracy Start': self.acc_start.compute(),
+                  'Epoch Accuracy End': self.acc_end.compute()}
+
+        self.log_dict(values)
+
     def validation_step(self, batch, batch_idx):
         loss, loss_start, loss_end, loss_end, accuracy_start, accuracy_end = self._custom_step(batch)
 
@@ -75,6 +84,12 @@ class ModelTrainer(pl.LightningModule):
         self.log_dict(values)
 
         return loss
+
+    def validation_epoch_end(self, outputs):
+        values = {'Epoch Accuracy Start': self.acc_start.compute(),
+                  'Epoch Accuracy End': self.acc_end.compute()}
+
+        self.log_dict(values)
 
 
 if __name__ == '__main__':

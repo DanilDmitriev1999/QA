@@ -2,7 +2,7 @@ import torch
 
 import pytorch_lightning as pl
 from transformers import AdamW
-from utils.metrics import ExactMatch
+from metrics import ExactMatch
 
 
 class ModelTrainer(pl.LightningModule):

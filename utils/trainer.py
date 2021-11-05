@@ -1,168 +1,183 @@
 import pytorch_lightning as pl
 from transformers import AdamW
-from torchmetrics import Metric
-import re
-import string
+from utils.metrics import *
 import torch
 
 
 
-def normalize_answer(s):
-    """Lower text and remove punctuation, articles and extra whitespace."""
-
-    def remove_articles(text):
-        regex = re.compile(r'\b(a|an|the)\b', re.UNICODE)
-        return re.sub(regex, ' ', text)
-
-    def white_space_fix(text):
-        return ' '.join(text.split())
-
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return ''.join(ch for ch in text if ch not in exclude)
-
-    def lower(text):
-        return text.lower()
-
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
-
-
-class F1Score(Metric):
-    def __init__(self, dist_sync_on_step=False):
-        super().__init__(dist_sync_on_step=dist_sync_on_step)
-
-        self.add_state("score", default=torch.tensor(0))
-        self.add_state("recall", default=torch.tensor(0))
-        self.add_state("precision", default=torch.tensor(0))
-
-    def update(self, pred, gold):
-        pred_tokens = normalize_answer(pred).split()
-        truth_tokens = normalize_answer(gold).split()
-
-        # if either the prediction or the truth is no-answer then f1 = 1 if they agree, 0 otherwise
-        if len(pred_tokens) == 0 or len(truth_tokens) == 0:
-            return int(pred_tokens == truth_tokens)
-
-        common_tokens = set(pred_tokens) & set(truth_tokens)
-
-        # if there are no common tokens then f1 = 0
-        if len(common_tokens) == 0:
-            return 0
-
-        self.precision = torch.tensor(len(common_tokens) / len(pred_tokens))
-        self.recall = torch.tensor(len(common_tokens) / len(truth_tokens))
-
-    def compute(self):
-        return 2 * (self.precision * self.recall) / (self.precision + self.recall)
-
-
-class ExactMatch(Metric):
-    def __init__(self, dist_sync_on_step=False):
-        super().__init__(dist_sync_on_step=dist_sync_on_step)
-
-        self.add_state("correct", default=torch.tensor(0))
-        self.add_state("total", default=torch.tensor(0))
-        self.add_state("exact_match", default=torch.tensor(0))
-
-    def update(self, pred, gold):
-        result = int(normalize_answer(gold) == normalize_answer(pred))
-
-        self.total += torch.tensor(1)
-
-        if result == 1:
-            self.correct += torch.tensor(1)
-
-    def compute(self):
-        return self.correct.float() / self.total.float()
-
-
-class ModelTrainer(pl.LightningModule):
-    def __init__(self, model, criterion, tokenizer, lr=1e-4):
+class ClassificationTrainer(pl.LightningModule):
+    def __init__(self, model, tokenizer, params: dict):
         super().__init__()
 
         self.model = model
-        self.criterion = criterion
-
-        self.em = ExactMatch()
-        self.f1 = F1Score()
+        self.params = params
         self.tokenizer = tokenizer
 
         # other
-        self.lr = lr
+        self.lr = self.params['lr']
+        self.check_train_metrics = self.params['check_train_metrics']
+        self.counter_train = 0
+
+        # self.save_hyperparameters()
+        self.dv = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        self.val_result = {
+            'pred': [],
+            'gold': [],
+        }
+        self.test_result = {
+            'pred': [],
+            'gold': [],
+        }
+        self.flatten = lambda l: [item for sublist in l for item in sublist]
 
     def forward(self, ids, mask):
-        logits_start, logits_end = self.model.forward(ids, mask)
+        logits = self.model.forward(ids, mask)
 
-        return logits_start, logits_end
+        return logits
 
     def configure_optimizers(self):
-        optimizer = AdamW(self.model.parameters(), lr=self.lr, eps=1e-8)
+        model = self.model
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": self.params['weight_decay'],
+            },
+            {
+                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = AdamW(optimizer_grouped_parameters, lr=self.params['lr'], eps=self.params['adam_epsilon'])
         return optimizer
-
-    def _custom_step(self, batch):
+        
+    def _custom_step(self, batch, batch_idx, mode=None):
         text = batch['input_ids']
         mask = batch['attention_mask']
         start = batch['start_positions']
         end = batch['end_positions']
 
-        logits_start, logits_end = self(text, mask)
+        gold = []
+        pred = []
 
-        loss_start = self.criterion(logits_start, start.view(-1, 1))
-        loss_end = self.criterion(logits_end, end.view(-1, 1))
+        logits = self(text, mask)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
 
-        loss = loss_start + loss_end
+        if len(start.size()) > 1:
+            start = start.squeeze(-1)
+        if len(end.size()) > 1:
+            end = end.squeeze(-1)
 
-        start_pred = torch.argmax(logits_start, dim=1).squeeze(-1).cpu().detach().numpy()
-        start_gold = start.cpu().detach().numpy()
+        ignored_index = start_logits.size(1)
+        start.clamp_(0, ignored_index)
+        end.clamp_(0, ignored_index)
 
-        end_pred = torch.argmax(logits_end, dim=1).squeeze(-1).cpu().detach().numpy()
-        end_gold = end.cpu().detach().numpy()
+        loss_fct = nn.CrossEntropyLoss(ignore_index=ignored_index)
 
-        text = text.cpu().detach().numpy()
+        loss_start = loss_fct(start_logits, start.long().to(self.dv))
+        loss_end = loss_fct(end_logits, end.long().to(self.dv))
 
-        for element_idx in range(len(text)):
-            pred = self.tokenizer.decode(text[element_idx][start_pred[element_idx]: end_pred[element_idx]])
-            gold = self.tokenizer.decode(text[element_idx][start_gold[element_idx]: end_gold[element_idx]])
+        loss = (loss_start + loss_end) / 2
 
-            em_step = self.em(pred, gold)
-            f1_step = self.f1(pred, gold)
+        if mode:
+            start_logits = start_logits.squeeze(-1)
+            end_logits = end_logits.squeeze(-1)
 
-        return loss, loss_start, loss_end, em_step, f1_step
+            start_pred = torch.argmax(start_logits, dim=1).squeeze(-1).cpu().detach().numpy()
+            start_gold = start.cpu().detach().numpy()
+
+            end_pred = torch.argmax(end_logits, dim=1).squeeze(-1).cpu().detach().numpy()
+            end_gold = end.cpu().detach().numpy()
+
+            for i in range(text.shape[0]):
+                all_tokens = self.tokenizer.convert_ids_to_tokens(text[i])
+
+                answer_pred = ' '.join(all_tokens[start_pred[i] : end_pred[i]])
+                ans_ids_pred = self.tokenizer.convert_tokens_to_ids(answer_pred.split())
+                answer_pred = self.tokenizer.decode(ans_ids_pred)
+
+                answer_gold = ' '.join(all_tokens[start_gold[i] : end_gold[i]])
+                ans_ids_gold = self.tokenizer.convert_tokens_to_ids(answer_gold.split())
+                answer_gold = self.tokenizer.decode(ans_ids_gold)
+
+                pred.append(answer_pred)
+                gold.append(answer_gold)
+
+            return loss, pred, gold
+        
+        return loss
 
     def training_step(self, batch, batch_idx):
-        loss, loss_start, loss_end, em, f1 = self._custom_step(batch)
+        loss = self._custom_step(batch, batch_idx)
 
-        values = {'train_loss_sum': loss,
-                  'train_start_loss': loss_start,
-                  'train_end_loss': loss_end,
-                  'train_exact_match': em,
-                  'train_f1': f1}
+        values = {'train_loss': loss}
 
         self.log_dict(values)
 
         return loss
-
-    def training_epoch_end(self, outputs):
-        values = {'Train Epoch Exact-Match': self.em.compute(),
-                  'Train Epoch F1': self.f1.compute()}
-
-        self.log_dict(values)
-
+    
     def validation_step(self, batch, batch_idx):
-        loss, loss_start, loss_end, em, f1 = self._custom_step(batch)
+        loss, pred, gold = self._custom_step(batch, batch_idx, 'val')
 
-        values = {'val_loss_sum': loss,
-                  'val_start_loss': loss_start,
-                  'val_end_loss': loss_end,
-                  'val_exact_match': em,
-                  'val_f1': f1}
+        values = {'loss_val': loss}
+
+        self.val_result['pred'].append(pred)
+        self.val_result['gold'].append(gold)
 
         self.log_dict(values)
 
         return loss
 
     def validation_epoch_end(self, outputs):
-        values = {'Validation Epoch Exact-Match': self.em.compute(),
-                  'Validation Epoch F1': self.f1.compute()}
+        predict_result = self.flatten(self.val_result['pred'])
+        gold_result = self.flatten(self.val_result['gold'])
+
+        metrics = evaluate(gold_result, predict_result)
+
+        f1 = metrics['f1']
+        EM = metrics['exact_match']
+        
+        values = {
+            'f1_val': f1,
+            'EM_val': EM, 
+        }
+        self.val_result['pred'] = []
+        self.val_result['gold'] = []
 
         self.log_dict(values)
+    
+    def test_step(self, batch, batch_idx):
+        loss, pred, gold = self._custom_step(batch, batch_idx, 'test')
+
+        values = {'loss_test': loss}
+
+        self.test_result['pred'].append(pred)
+        self.test_result['gold'].append(gold)
+
+        self.log_dict(values)
+
+        return loss
+    
+    def test_epoch_end(self, outputs):
+        predict_result = self.flatten(self.test_result['pred'])
+        gold_result = self.flatten(self.test_result['gold'])
+
+        metrics = evaluate(gold_result, predict_result)
+
+        f1 = metrics['f1']
+        EM = metrics['exact_match']
+        
+        values = {
+            'f1_test': f1,
+            'EM_test': EM, 
+        }
+        self.test_result['pred'] = []
+        self.test_result['gold'] = []
+
+        self.log_dict(values)
+
+if __name__ == '__main__':
+    pass

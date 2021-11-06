@@ -9,7 +9,7 @@ class QADataset:
         return len(self.dataset)
 
     def __getitem__(self, idx) -> dict:
-        context = self.dataset[idx]['context']
+        context = self.dataset[idx]['context'][:450]
         question = self.dataset[idx]['qas'][0]['question']
         encodings = self.tokenizer(context, question, truncation=True)
 
